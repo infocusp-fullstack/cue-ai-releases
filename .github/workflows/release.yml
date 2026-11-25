@@ -1,0 +1,337 @@
+# Cue AI desktop release workflow.
+#
+# This file lives in the PUBLIC repository infocusp-fullstack/cue-ai-releases at
+# .github/workflows/release.yml. Its source of truth is docs/release-workflow/release.yml
+# in the PRIVATE repository infocusp-fullstack/cue-ai; edit it there, then copy it over.
+#
+# It clones the private source with a read-only token, runs the checks, builds the
+# installers for macOS, Windows and Linux, and attaches them to a GitHub Release here.
+# See docs/release-workflow/README.md for the setup steps.
+
+name: Release desktop app
+
+run-name: Release ${{ inputs.branch }} (draft=${{ inputs.draft }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Branch of the private source repository to build
+        type: choice
+        options:
+          - main
+          - qa
+        default: main
+      build_macos:
+        description: Build macOS installers (dmg, zip)
+        type: boolean
+        default: true
+      build_windows:
+        description: Build Windows installer (nsis exe)
+        type: boolean
+        default: true
+      build_linux:
+        description: Build Linux installers (AppImage, deb)
+        type: boolean
+        default: true
+      draft:
+        description: Create the release as a draft (only repository members can see it until it is published)
+        type: boolean
+        default: false
+
+# Nothing gets write access by default; only the publish job asks for it.
+permissions: {}
+
+# Never run two releases of the same branch at the same time.
+concurrency:
+  group: release-${{ inputs.branch }}
+  cancel-in-progress: false
+
+env:
+  PRIVATE_REPOSITORY: infocusp-fullstack/cue-ai
+  GIT_TERMINAL_PROMPT: "0"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Clone the source, work out version / tag / Node version, run the checks.
+  #    If anything here fails, no installers are built.
+  # ---------------------------------------------------------------------------
+  verify:
+    name: Checks (typecheck, lint, unit tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions: {}
+    outputs:
+      commit: ${{ steps.clone.outputs.commit }}
+      version: ${{ steps.metadata.outputs.version }}
+      tag: ${{ steps.metadata.outputs.tag }}
+      prerelease: ${{ steps.metadata.outputs.prerelease }}
+      node_version: ${{ steps.metadata.outputs.node_version }}
+      matrix: ${{ steps.metadata.outputs.matrix }}
+    steps:
+      - name: Clone private source
+        id: clone
+        env:
+          PRIVATE_REPO_PAT: ${{ secrets.PRIVATE_REPO_PAT }}
+          SOURCE_BRANCH: ${{ inputs.branch }}
+        run: |
+          if [ -z "${PRIVATE_REPO_PAT}" ]; then
+            echo "::error::Secret PRIVATE_REPO_PAT is not set. See docs/release-workflow/README.md in the source repository."
+            exit 1
+          fi
+          git clone --quiet --depth 1 --branch "${SOURCE_BRANCH}" \
+            "https://x-access-token:${PRIVATE_REPO_PAT}@github.com/${PRIVATE_REPOSITORY}.git" .
+          # Drop the remote so the token is not kept in .git/config.
+          git remote remove origin
+          if grep -q "x-access-token" .git/config; then
+            echo "::error::Token still present in .git/config"
+            exit 1
+          fi
+          echo "commit=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+          echo "Cloned ${PRIVATE_REPOSITORY}@$(git rev-parse --short HEAD) (${SOURCE_BRANCH})"
+
+      - name: Read version, tag and Node version
+        id: metadata
+        env:
+          SOURCE_BRANCH: ${{ inputs.branch }}
+          BUILD_MACOS: ${{ inputs.build_macos }}
+          BUILD_WINDOWS: ${{ inputs.build_windows }}
+          BUILD_LINUX: ${{ inputs.build_linux }}
+        run: |
+          version="$(node -p "require('./electron/package.json').version")"
+          if ! [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::electron/package.json version '${version}' is not MAJOR.MINOR.PATCH"
+            exit 1
+          fi
+
+          if [ "${SOURCE_BRANCH}" = "qa" ]; then
+            tag="v${version}-qa.${GITHUB_RUN_NUMBER}"
+            prerelease=true
+          else
+            tag="v${version}"
+            prerelease=false
+          fi
+
+          # Node version: .nvmrc (electron/ or repo root), else "engines.node" in electron/package.json.
+          if [ -f electron/.nvmrc ]; then
+            node_version="$(tr -d '[:space:]' < electron/.nvmrc)"
+          elif [ -f .nvmrc ]; then
+            node_version="$(tr -d '[:space:]' < .nvmrc)"
+          else
+            node_version="$(node -p "(require('./electron/package.json').engines || {}).node || ''")"
+          fi
+          if [ -z "${node_version}" ]; then
+            echo "::error::No Node version found (.nvmrc or engines.node in electron/package.json)"
+            exit 1
+          fi
+
+          # Build matrix from the selected platforms.
+          matrix_entries=()
+          [ "${BUILD_MACOS}" = "true" ] && matrix_entries+=('{"platform":"mac","runner":"macos-latest"}')
+          [ "${BUILD_WINDOWS}" = "true" ] && matrix_entries+=('{"platform":"win","runner":"windows-latest"}')
+          [ "${BUILD_LINUX}" = "true" ] && matrix_entries+=('{"platform":"linux","runner":"ubuntu-latest"}')
+          if [ "${#matrix_entries[@]}" -eq 0 ]; then
+            echo "::error::Select at least one platform to build"
+            exit 1
+          fi
+          matrix="{\"include\":[$(IFS=,; echo "${matrix_entries[*]}")]}"
+
+          {
+            echo "version=${version}"
+            echo "tag=${tag}"
+            echo "prerelease=${prerelease}"
+            echo "node_version=${node_version}"
+            echo "matrix=${matrix}"
+          } >> "${GITHUB_OUTPUT}"
+          echo "Version ${version}, tag ${tag}, prerelease ${prerelease}, Node ${node_version}"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ steps.metadata.outputs.node_version }}
+          cache: npm
+          cache-dependency-path: electron/package-lock.json
+
+      - name: Install dependencies
+        working-directory: electron
+        run: npm ci
+
+      - name: Typecheck
+        working-directory: electron
+        run: npm run typecheck
+
+      - name: Lint
+        working-directory: electron
+        run: npm run lint
+
+      - name: Unit tests
+        working-directory: electron
+        run: npm test -- --watch=false
+
+  # ---------------------------------------------------------------------------
+  # 2. Build the installers, one job per selected platform.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build (${{ matrix.platform }})
+    needs: verify
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions: {}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.verify.outputs.matrix) }}
+    steps:
+      - name: Clone private source (same commit as the checks)
+        env:
+          PRIVATE_REPO_PAT: ${{ secrets.PRIVATE_REPO_PAT }}
+          SOURCE_BRANCH: ${{ inputs.branch }}
+          EXPECTED_COMMIT: ${{ needs.verify.outputs.commit }}
+        run: |
+          git clone --quiet --depth 1 --branch "${SOURCE_BRANCH}" \
+            "https://x-access-token:${PRIVATE_REPO_PAT}@github.com/${PRIVATE_REPOSITORY}.git" .
+          # If someone pushed after the checks ran, build the commit that was checked.
+          if [ "$(git rev-parse HEAD)" != "${EXPECTED_COMMIT}" ]; then
+            git fetch --quiet --depth 1 origin "${EXPECTED_COMMIT}"
+            git checkout --quiet --detach FETCH_HEAD
+          fi
+          git remote remove origin
+          if grep -q "x-access-token" .git/config; then
+            echo "::error::Token still present in .git/config"
+            exit 1
+          fi
+          echo "Building ${PRIVATE_REPOSITORY}@$(git rev-parse --short HEAD)"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ needs.verify.outputs.node_version }}
+          cache: npm
+          cache-dependency-path: electron/package-lock.json
+
+      - name: Point Electron download caches at a cacheable folder
+        run: |
+          echo "ELECTRON_CACHE=${RUNNER_TEMP}/electron-cache" >> "${GITHUB_ENV}"
+          echo "ELECTRON_BUILDER_CACHE=${RUNNER_TEMP}/electron-builder-cache" >> "${GITHUB_ENV}"
+
+      - name: Cache Electron downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ runner.temp }}/electron-cache
+            ${{ runner.temp }}/electron-builder-cache
+          key: electron-${{ runner.os }}-${{ hashFiles('electron/package-lock.json') }}
+          restore-keys: electron-${{ runner.os }}-
+
+      - name: Install dependencies
+        working-directory: electron
+        run: npm ci
+
+      - name: Build Angular app
+        working-directory: electron
+        run: npm run build
+
+      - name: Build Electron main process
+        working-directory: electron
+        run: npm run build:electron
+
+      - name: Package installers (electron-builder)
+        working-directory: electron
+        env:
+          # Optional signing secrets. When they are not set, the installers are unsigned.
+          SIGNING_CSC_LINK: ${{ secrets.CSC_LINK }}
+          SIGNING_CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          SIGNING_WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+          SIGNING_WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+          TARGET_PLATFORM: ${{ matrix.platform }}
+        run: |
+          if [ -n "${SIGNING_CSC_LINK}" ]; then
+            export CSC_LINK="${SIGNING_CSC_LINK}" CSC_KEY_PASSWORD="${SIGNING_CSC_KEY_PASSWORD}"
+          fi
+          if [ -n "${SIGNING_WIN_CSC_LINK}" ]; then
+            export WIN_CSC_LINK="${SIGNING_WIN_CSC_LINK}" WIN_CSC_KEY_PASSWORD="${SIGNING_WIN_CSC_KEY_PASSWORD}"
+          fi
+          if [ -z "${CSC_LINK:-}" ] && [ -z "${WIN_CSC_LINK:-}" ]; then
+            echo "No signing certificate configured: building unsigned installers"
+            export CSC_IDENTITY_AUTO_DISCOVERY=false
+          fi
+          npm run package -- "--${TARGET_PLATFORM}"
+
+      - name: List installers (names and sizes only)
+        working-directory: electron/release
+        run: ls -l cue-ai-*
+
+      - name: Upload installers for the publish job
+        uses: actions/upload-artifact@v4
+        with:
+          name: installers-${{ matrix.platform }}
+          path: |
+            electron/release/cue-ai-*.dmg
+            electron/release/cue-ai-*.zip
+            electron/release/cue-ai-*.exe
+            electron/release/cue-ai-*.AppImage
+            electron/release/cue-ai-*.deb
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # 3. Attach all installers to one GitHub Release in this (public) repository.
+  #    Runs only if every selected platform built successfully.
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Publish GitHub Release
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download installers
+        uses: actions/download-artifact@v4
+        with:
+          pattern: installers-*
+          merge-multiple: true
+          path: installers
+
+      - name: Write checksums
+        working-directory: installers
+        run: |
+          sha256sum cue-ai-* > SHA256SUMS.txt
+          ls -l
+
+      - name: Create release and upload installers
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.verify.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.verify.outputs.version }}
+          IS_PRERELEASE: ${{ needs.verify.outputs.prerelease }}
+          IS_DRAFT: ${{ inputs.draft }}
+          SOURCE_BRANCH: ${{ inputs.branch }}
+          SOURCE_COMMIT: ${{ needs.verify.outputs.commit }}
+        run: |
+          if gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" > /dev/null 2>&1; then
+            echo "::error::Release ${RELEASE_TAG} already exists. Bump the version in electron/package.json of the source repository, or delete the old release first."
+            exit 1
+          fi
+
+          release_flags=()
+          [ "${IS_DRAFT}" = "true" ] && release_flags+=(--draft)
+          if [ "${IS_PRERELEASE}" = "true" ]; then
+            release_flags+=(--prerelease --latest=false)
+          fi
+
+          release_notes="Cue AI ${RELEASE_VERSION} built from the ${SOURCE_BRANCH} branch (source commit ${SOURCE_COMMIT:0:7}).
+
+          The installers are not code-signed yet: macOS and Windows will show a security warning on first launch.
+          Verify downloads with SHA256SUMS.txt."
+
+          gh release create "${RELEASE_TAG}" installers/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --target "${GITHUB_SHA}" \
+            --title "Cue AI ${RELEASE_TAG}" \
+            --notes "${release_notes}" \
+            "${release_flags[@]}"
+          echo "Published ${RELEASE_TAG} (draft=${IS_DRAFT}, prerelease=${IS_PRERELEASE})"
