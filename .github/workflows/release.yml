@@ -20,7 +20,8 @@ on:
         type: choice
         options:
           - main
-          - qa
+          - feat/69-cue-electron-builds-for-macos-windows-an
+          - dev
         default: main
       build_macos:
         description: Build macOS installers (dmg, zip)
@@ -108,12 +109,13 @@ jobs:
             exit 1
           fi
 
-          if [ "${SOURCE_BRANCH}" = "qa" ]; then
-            tag="v${version}-qa.${GITHUB_RUN_NUMBER}"
-            prerelease=true
-          else
+          # main -> v1.2.3 (release). Any other branch -> v1.2.3-<branch>.<run> (pre-release).
+          if [ "${SOURCE_BRANCH}" = "main" ]; then
             tag="v${version}"
             prerelease=false
+          else
+            tag="v${version}-${SOURCE_BRANCH}.${GITHUB_RUN_NUMBER}"
+            prerelease=true
           fi
 
           # Node version: .nvmrc (electron/ or repo root), else "engines.node" in electron/package.json.
